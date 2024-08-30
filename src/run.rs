@@ -151,6 +151,11 @@ pub struct Runner<L: Language, N: Analysis<L>, IterData = ()> {
     #[allow(clippy::type_complexity)]
     pub hooks: Vec<Box<dyn FnMut(&mut Self) -> Result<(), String>>>,
 
+    /// The goals added by the
+    /// [`with_goal`](Runner::with_goal()) method, in insertion order.
+    #[allow(clippy::type_complexity)]
+    pub goals: Vec<Box<dyn Fn(&Self) -> bool>>,
+
     // limits
     iter_limit: usize,
     node_limit: usize,
@@ -184,6 +189,7 @@ where
             roots,
             stop_reason,
             hooks,
+            goals,
             iter_limit,
             node_limit,
             time_limit,
@@ -197,6 +203,7 @@ where
             .field("roots", roots)
             .field("stop_reason", stop_reason)
             .field("hooks", &vec![format_args!("<dyn FnMut ..>"); hooks.len()])
+            .field("goals", &vec![format_args!("<dyn FnMut ..>"); goals.len()])
             .field("iter_limit", iter_limit)
             .field("node_limit", node_limit)
             .field("time_limit", time_limit)
@@ -220,6 +227,10 @@ pub enum StopReason {
     NodeLimit(usize),
     /// The time limit was hit. The data is the time limit in seconds.
     TimeLimit(f64),
+    /// A goal was reached. Which goal is specified by the data that
+    /// corresponds to the insertion order in which the goals were
+    /// added.
+    GoalReached(usize),
     /// Some other reason to stop.
     Other(String),
 }
@@ -286,6 +297,8 @@ pub struct Iteration<IterData> {
     pub applied: IndexMap<Symbol, usize>,
     /// Seconds spent running hooks.
     pub hook_time: f64,
+    /// Seconds spent running goal checks.
+    pub goal_time: f64,
     /// Seconds spent searching in this iteration.
     pub search_time: f64,
     /// Seconds spent applying rules in this iteration.
@@ -323,6 +336,7 @@ where
             iterations: vec![],
             stop_reason: None,
             hooks: vec![],
+            goals: vec![],
 
             start_time: None,
             scheduler: Box::new(BackoffScheduler::default()),
@@ -372,6 +386,39 @@ where
         F: FnMut(&mut Self) -> Result<(), String> + 'static,
     {
         self.hooks.push(Box::new(hook));
+        self
+    }
+
+    /// Add a goal to stop the runner once it has been reached [`Runner`].
+    /// Each goal will be checked at the beginning of each iteration, i.e. before
+    /// all the rewrites or hooks.
+    ///
+    /// # Example
+    /// ```
+    /// # use egg::*;
+    /// let rules: &[Rewrite<SymbolLang, ()>] = &[
+    ///     rewrite!("commute-add"; "(+ ?a ?b)" => "(+ ?b ?a)"),
+    ///     // probably some others ...
+    /// ];
+    ///
+    /// Runner::<SymbolLang, ()>::default()
+    ///     .with_expr(&"(+ 5 2)".parse().unwrap())
+    ///     .with_expr(&"(+ 2 5)".parse().unwrap())
+    ///     .with_goal(|runner| {
+    ///          let mut uniq = hashbrown::HashSet::new();
+    ///          if runner.roots.iter().map(|id| runner.egraph.find(*id)).all(move |x| uniq.insert(x)) {
+    ///             println!("Two roots in the same eclass!");
+    ///             return true
+    ///          }
+    ///          false
+    ///     })
+    ///     .run(rules);
+    /// ```
+    pub fn with_goal<F>(mut self, goal: F) -> Self
+    where
+        F: Fn(&Self) -> bool + 'static,
+    {
+        self.goals.push(Box::new(goal));
         self
     }
 
@@ -518,6 +565,18 @@ where
         let egraph_nodes = self.egraph.total_size();
         let egraph_classes = self.egraph.number_of_classes();
 
+        let goal_time = Instant::now();
+        result = result.and_then(|_| {
+            self.goals.iter().enumerate().try_for_each(|(idx, goal)| {
+                if goal(self) {
+                    Err(StopReason::GoalReached(idx))
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        let goal_time = goal_time.elapsed().as_secs_f64();
+
         let hook_time = Instant::now();
         let mut hooks = std::mem::take(&mut self.hooks);
         result = result.and_then(|_| {
@@ -605,6 +664,7 @@ where
             egraph_nodes,
             egraph_classes,
             hook_time,
+            goal_time,
             search_time,
             apply_time,
             rebuild_time,
