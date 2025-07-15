@@ -151,25 +151,31 @@ pub struct Runner<L: Language, N: Analysis<L>, IterData = ()> {
     #[allow(clippy::type_complexity)]
     pub hooks: Vec<Box<dyn FnMut(&mut Self) -> Result<(), String>>>,
 
-    limits: RunnerLimits,
+    limits: RunnerLimits<L>,
     scheduler: Box<dyn RewriteScheduler<L, N>>,
 }
 
 /// Describes the limits that would stop a [`Runner`].
 #[derive(Debug)]
-pub struct RunnerLimits {
+pub struct RunnerLimits<L: Language> {
     iter_limit: usize,
     node_limit: usize,
     memory_limit: usize,
     time_limit: Duration,
     start_time: Option<Instant>,
+    guides: Vec<RecExpr<L>>,
+    goal: Option<RecExpr<L>>,
 }
 
-impl RunnerLimits {
+impl<L: Language> RunnerLimits<L> {
     /// Check if the [`Runner`] should stop based on the limits.
-    pub fn check_limits<L, N>(&self, iteration: usize, egraph: &EGraph<L, N>) -> RunnerResult<()>
+    pub fn check_limits<N>(
+        &self,
+        iteration: usize,
+        egraph: &EGraph<L, N>,
+        roots: &[Id],
+    ) -> RunnerResult<()>
     where
-        L: Language,
         N: Analysis<L>,
     {
         let elapsed = self.start_time.unwrap().elapsed();
@@ -189,6 +195,25 @@ impl RunnerLimits {
         let memory_usage = memory_stats::memory_stats().expect("Could not read memory");
         if memory_usage.physical_mem > self.memory_limit {
             return Err(StopReason::MemoryLimit(memory_usage.physical_mem));
+        }
+
+        for root in roots {
+            let canonical_root = egraph.find(*root);
+            if let Some(goal) = &self.goal {
+                if let Some(goal_id) = egraph.lookup_expr(goal) {
+                    if egraph.find(goal_id) == canonical_root {
+                        return Err(StopReason::GoalFound(canonical_root));
+                    }
+                }
+
+                for (idx, guide) in self.guides.iter().enumerate() {
+                    if let Some(guide_id) = egraph.lookup_expr(guide) {
+                        if egraph.find(guide_id) == canonical_root {
+                            return Err(StopReason::GuideFound(canonical_root, idx));
+                        }
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -251,6 +276,10 @@ pub enum StopReason {
     MemoryLimit(usize),
     /// The time limit was hit. The data is the time limit in seconds.
     TimeLimit(f64),
+    /// The Goal was found. The data indicates in which root.
+    GoalFound(Id),
+    /// A guide was found. The data indicates which root and what guide.
+    GuideFound(Id, usize),
     /// Some other reason to stop.
     Other(String),
 }
@@ -354,6 +383,8 @@ where
                 memory_limit: 64_000_000_000,
                 time_limit: Duration::from_secs(5),
                 start_time: None,
+                guides: Vec::new(),
+                goal: None,
             },
             egraph: EGraph::new(analysis),
             roots: vec![],
@@ -386,6 +417,13 @@ where
     /// Sets the runner time limit. Default: 5 seconds
     pub fn with_time_limit(mut self, time_limit: Duration) -> Self {
         self.limits.time_limit = time_limit;
+        self
+    }
+
+    /// Add a goal to search for and potential guides
+    pub fn with_goals(mut self, goal: RecExpr<L>, guides: Vec<RecExpr<L>>) -> Self {
+        self.limits.goal = Some(goal);
+        self.limits.guides = guides;
         self
     }
 
@@ -573,9 +611,13 @@ where
         let mut matches = Vec::new();
         let mut applied = IndexMap::default();
         result = result.and_then(|_| {
-            matches = self
-                .scheduler
-                .search_rewrites(i, &self.egraph, rules, &self.limits)?;
+            matches = self.scheduler.search_rewrites(
+                i,
+                &self.egraph,
+                &self.roots,
+                rules,
+                &self.limits,
+            )?;
             Ok(())
             // rules.iter().try_for_each(|rw| {
             //     let ms = self.scheduler.search_rewrite(i, &self.egraph, rw);
@@ -664,7 +706,7 @@ where
 
     fn check_limits(&self) -> RunnerResult<()> {
         self.limits
-            .check_limits(self.iterations.len(), &self.egraph)
+            .check_limits(self.iterations.len(), &self.egraph, &self.roots)
     }
 }
 
@@ -740,8 +782,9 @@ where
     ///         &mut self,
     ///         iteration: usize,
     ///         egraph: &EGraph<SymbolLang, ()>,
+    ///         roots: &[Id],
     ///         rewrites: &[&'a Rewrite<SymbolLang, ()>],
-    ///         _limits: &RunnerLimits,
+    ///         _limits: &RunnerLimits<SymbolLang>,
     ///     ) -> RunnerResult<Vec<Vec<SearchMatches<'a, SymbolLang>>>> {
     ///         // this implementation just ignores the limits
     ///         // fake `par_map` to enforce Send + Sync, in real life use rayon
@@ -761,14 +804,15 @@ where
         &mut self,
         iteration: usize,
         egraph: &EGraph<L, N>,
+        roots: &[Id],
         rewrites: &[&'a Rewrite<L, N>],
-        limits: &RunnerLimits,
+        limits: &RunnerLimits<L>,
     ) -> RunnerResult<Vec<Vec<SearchMatches<'a, L>>>> {
         let mut matches = Vec::new();
         for rw in rewrites {
             let ms = self.search_rewrite(iteration, egraph, rw);
             matches.push(ms);
-            limits.check_limits(iteration, egraph)?;
+            limits.check_limits(iteration, egraph, roots)?;
         }
         Ok(matches)
     }
