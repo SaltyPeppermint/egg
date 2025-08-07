@@ -1,4 +1,7 @@
-use std::fmt::{self, Debug, Formatter};
+use std::{
+    fmt::{self, Debug, Formatter},
+    path::Display,
+};
 
 use log::*;
 
@@ -138,46 +141,49 @@ pub struct Runner<L: Language, N: Analysis<L>, IterData = ()> {
     /// The [`EGraph`] used.
     pub egraph: EGraph<L, N>,
     /// Data accumulated over each [`Iteration`].
-    pub iterations: Vec<Iteration<IterData>>,
+    pub iterations: Vec<Iteration<IterData, L>>,
     /// The roots of expressions added by the
     /// [`with_expr`](Runner::with_expr()) method, in insertion order.
     pub roots: Vec<Id>,
     /// Why the `Runner` stopped. This will be `None` if it hasn't
     /// stopped yet.
-    pub stop_reason: Option<StopReason>,
+    pub stop_reason: Option<StopReason<L>>,
 
     /// The hooks added by the
     /// [`with_hook`](Runner::with_hook()) method, in insertion order.
     #[allow(clippy::type_complexity)]
     pub hooks: Vec<Box<dyn FnMut(&mut Self) -> Result<(), String>>>,
 
-    limits: RunnerLimits<L>,
+    limits: RunnerLimits<L, N>,
     scheduler: Box<dyn RewriteScheduler<L, N>>,
+}
+
+/// Used to dynamically provide guides to the egraph
+pub trait Guide<L: Language, N: Analysis<L>>: Debug {
+    /// Check if guide has been reached
+    fn check(&self, egraph: &EGraph<L, N>) -> Option<(Id, RecExpr<L>)>;
 }
 
 /// Describes the limits that would stop a [`Runner`].
 #[derive(Debug)]
-pub struct RunnerLimits<L: Language> {
+pub struct RunnerLimits<L: Language, N: Analysis<L>> {
     iter_limit: usize,
     node_limit: usize,
     memory_limit: usize,
     time_limit: Duration,
     start_time: Option<Instant>,
-    guides: Vec<RecExpr<L>>,
+    guides: Vec<Box<dyn Guide<L, N>>>,
     goal: Option<RecExpr<L>>,
 }
 
-impl<L: Language> RunnerLimits<L> {
+impl<L: Language, N: Analysis<L>> RunnerLimits<L, N> {
     /// Check if the [`Runner`] should stop based on the limits.
-    pub fn check_limits<N>(
+    pub fn check_limits(
         &self,
         iteration: usize,
         egraph: &EGraph<L, N>,
         roots: &[Id],
-    ) -> RunnerResult<()>
-    where
-        N: Analysis<L>,
-    {
+    ) -> RunnerResult<(), L> {
         let elapsed = self.start_time.unwrap().elapsed();
         if elapsed > self.time_limit {
             return Err(StopReason::TimeLimit(elapsed.as_secs_f64()));
@@ -207,9 +213,9 @@ impl<L: Language> RunnerLimits<L> {
                 }
 
                 for (idx, guide) in self.guides.iter().enumerate() {
-                    if let Some(guide_id) = egraph.lookup_expr(guide) {
-                        if egraph.find(guide_id) == canonical_root {
-                            return Err(StopReason::GuideFound(canonical_root, idx));
+                    if let Some((matched_id, matched_guide)) = guide.check(egraph) {
+                        if egraph.find(matched_id) == canonical_root {
+                            return Err(StopReason::GuideFound(matched_guide.clone(), idx));
                         }
                     }
                 }
@@ -232,8 +238,8 @@ where
 
 impl<L, N, IterData> Debug for Runner<L, N, IterData>
 where
-    L: Language,
-    N: Analysis<L>,
+    L: Language + Debug,
+    N: Analysis<L> + Debug,
     IterData: Debug,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -264,7 +270,7 @@ where
 ///
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde-1", derive(serde::Serialize))]
-pub enum StopReason {
+pub enum StopReason<L: Language + Debug> {
     /// The egraph saturated, i.e., there was an iteration where we
     /// didn't learn anything new from applying the rules.
     Saturated,
@@ -279,7 +285,7 @@ pub enum StopReason {
     /// The Goal was found. The data indicates in which root.
     GoalFound(Id),
     /// A guide was found. The data indicates which root and what guide.
-    GuideFound(Id, usize),
+    GuideFound(RecExpr<L>, usize),
     /// Some other reason to stop.
     Other(String),
 }
@@ -293,10 +299,10 @@ pub enum StopReason {
 #[cfg_attr(feature = "serde-1", derive(serde::Serialize))]
 #[non_exhaustive]
 #[allow(missing_docs)]
-pub struct Report {
+pub struct Report<L: Language + std::fmt::Display> {
     /// The number of iterations this runner performed.
     pub iterations: usize,
-    pub stop_reason: StopReason,
+    pub stop_reason: StopReason<L>,
     pub egraph_nodes: usize,
     pub egraph_classes: usize,
     pub memo_size: usize,
@@ -307,7 +313,7 @@ pub struct Report {
     pub rebuild_time: f64,
 }
 
-impl std::fmt::Display for Report {
+impl<L: Language + std::fmt::Display> std::fmt::Display for Report<L> {
     #[rustfmt::skip]
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         writeln!(f, "Runner report")?;
@@ -334,7 +340,7 @@ impl std::fmt::Display for Report {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde-1", derive(serde::Serialize))]
 #[non_exhaustive]
-pub struct Iteration<IterData> {
+pub struct Iteration<IterData, L: Language> {
     /// The number of enodes in the egraph at the start of this
     /// iteration.
     pub egraph_nodes: usize,
@@ -362,11 +368,11 @@ pub struct Iteration<IterData> {
     /// The number of rebuild iterations done after this iteration completed.
     pub n_rebuilds: usize,
     /// If the runner stopped on this iterations, this is the reason
-    pub stop_reason: Option<StopReason>,
+    pub stop_reason: Option<StopReason<L>>,
 }
 
 /// Type alias for the result of a [`Runner`].
-pub type RunnerResult<T> = std::result::Result<T, StopReason>;
+pub type RunnerResult<T, L> = std::result::Result<T, StopReason<L>>;
 
 impl<L, N, IterData> Runner<L, N, IterData>
 where
@@ -421,7 +427,7 @@ where
     }
 
     /// Add a goal to search for and potential guides
-    pub fn with_goals(mut self, goal: RecExpr<L>, guides: Vec<RecExpr<L>>) -> Self {
+    pub fn with_goals(mut self, goal: RecExpr<L>, guides: Vec<Box<dyn Guide<L, N>>>) -> Self {
         self.limits.goal = Some(goal);
         self.limits.guides = guides;
         self
@@ -559,12 +565,18 @@ where
     }
 
     /// Prints some information about a runners run.
-    pub fn print_report(&self) {
+    pub fn print_report(&self)
+    where
+        L: std::fmt::Display,
+    {
         println!("{}", self.report())
     }
 
     /// Creates a [`Report`] summarizing this `Runner`s run.
-    pub fn report(&self) -> Report {
+    pub fn report(&self) -> Report<L>
+    where
+        L: std::fmt::Display,
+    {
         Report {
             stop_reason: self.stop_reason.clone().unwrap(),
             iterations: self.iterations.len(),
@@ -579,7 +591,7 @@ where
         }
     }
 
-    fn run_one(&mut self, rules: &[&Rewrite<L, N>]) -> Iteration<IterData> {
+    fn run_one(&mut self, rules: &[&Rewrite<L, N>]) -> Iteration<IterData, L> {
         assert!(self.stop_reason.is_none());
 
         info!("\nIteration {}", self.iterations.len());
@@ -704,7 +716,7 @@ where
         self.limits.start_time.get_or_insert_with(Instant::now);
     }
 
-    fn check_limits(&self) -> RunnerResult<()> {
+    fn check_limits(&self) -> RunnerResult<(), L> {
         self.limits
             .check_limits(self.iterations.len(), &self.egraph, &self.roots)
     }
@@ -806,8 +818,8 @@ where
         egraph: &EGraph<L, N>,
         roots: &[Id],
         rewrites: &[&'a Rewrite<L, N>],
-        limits: &RunnerLimits<L>,
-    ) -> RunnerResult<Vec<Vec<SearchMatches<'a, L>>>> {
+        limits: &RunnerLimits<L, N>,
+    ) -> RunnerResult<Vec<Vec<SearchMatches<'a, L>>>, L> {
         let mut matches = Vec::new();
         for rw in rewrites {
             let ms = self.search_rewrite(iteration, egraph, rw);
