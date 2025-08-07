@@ -158,7 +158,7 @@ pub struct Runner<L: Language, N: Analysis<L>, IterData = ()> {
 /// Used to dynamically provide guides to the egraph
 pub trait Guide<L: Language, N: Analysis<L>>: Debug {
     /// Check if guide has been reached
-    fn check(&self, egraph: &EGraph<L, N>) -> Option<(Id, RecExpr<L>)>;
+    fn check(&self, egraph: &EGraph<L, N>, id: Id) -> Option<RecExpr<L>>;
 }
 
 /// Describes the limits that would stop a [`Runner`].
@@ -210,10 +210,8 @@ impl<L: Language, N: Analysis<L>> RunnerLimits<L, N> {
                 }
 
                 for (idx, guide) in self.guides.iter().enumerate() {
-                    if let Some((matched_id, matched_guide)) = guide.check(egraph) {
-                        if egraph.find(matched_id) == canonical_root {
-                            return Err(StopReason::GuideFound(matched_guide.clone(), idx));
-                        }
+                    if let Some(matched_guide) = guide.check(egraph, canonical_root) {
+                        return Err(StopReason::GuideFound(matched_guide, idx));
                     }
                 }
             }
