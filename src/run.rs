@@ -1,7 +1,4 @@
-use std::{
-    fmt::{self, Debug, Formatter},
-    path::Display,
-};
+use std::fmt::{self, Debug, Formatter};
 
 use log::*;
 
@@ -269,7 +266,11 @@ where
 /// Error returned by [`Runner`] when it stops.
 ///
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde-1", derive(serde::Serialize))]
+#[cfg_attr(
+    feature = "serde-1",
+    derive(serde::Serialize),
+    serde(bound = "L: std::fmt::Display")
+)]
 pub enum StopReason<L: Language + Debug> {
     /// The egraph saturated, i.e., there was an iteration where we
     /// didn't learn anything new from applying the rules.
@@ -296,10 +297,14 @@ pub enum StopReason<L: Language + Debug> {
 /// but summed across iterations.
 /// See [`Iteration`] docs for details about fields.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde-1", derive(serde::Serialize))]
+#[cfg_attr(
+    feature = "serde-1",
+    derive(serde::Serialize),
+    serde(bound = "L: std::fmt::Display")
+)]
 #[non_exhaustive]
 #[allow(missing_docs)]
-pub struct Report<L: Language + std::fmt::Display> {
+pub struct Report<L: Language> {
     /// The number of iterations this runner performed.
     pub iterations: usize,
     pub stop_reason: StopReason<L>,
@@ -338,7 +343,11 @@ impl<L: Language + std::fmt::Display> std::fmt::Display for Report<L> {
 ///
 /// [ser]: https://docs.rs/serde/latest/serde/trait.Serialize.html
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde-1", derive(serde::Serialize))]
+#[cfg_attr(
+    feature = "serde-1",
+    derive(serde::Serialize),
+    serde(bound = "L: std::fmt::Display, IterData: serde::Serialize")
+)]
 #[non_exhaustive]
 pub struct Iteration<IterData, L: Language> {
     /// The number of enodes in the egraph at the start of this
