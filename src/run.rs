@@ -146,6 +146,9 @@ pub struct Runner<L: Language, N: Analysis<L>, IterData = ()> {
     /// Why the `Runner` stopped. This will be `None` if it hasn't
     /// stopped yet.
     pub stop_reason: Option<StopReason>,
+    /// A snapshot of scheduler state captured before the current iteration's
+    /// hooks and rewrite search.
+    pub scheduler_stats: SchedulerStats,
 
     /// The hooks added by the
     /// [`with_hook`](Runner::with_hook()) method, in insertion order.
@@ -213,6 +216,7 @@ where
             iterations,
             roots,
             stop_reason,
+            scheduler_stats,
             hooks,
             limits,
             scheduler: _,
@@ -223,6 +227,7 @@ where
             .field("iterations", iterations)
             .field("roots", roots)
             .field("stop_reason", stop_reason)
+            .field("scheduler_stats", scheduler_stats)
             .field("hooks", &vec![format_args!("<dyn FnMut ..>"); hooks.len()])
             .field("limits", limits)
             .field("scheduler", &format_args!("<dyn RewriteScheduler ..>"))
@@ -350,6 +355,7 @@ where
             roots: vec![],
             iterations: vec![],
             stop_reason: None,
+            scheduler_stats: SchedulerStats::default(),
             hooks: vec![],
             scheduler: Box::new(BackoffScheduler::default()),
         }
@@ -526,10 +532,12 @@ where
     fn run_one(&mut self, rules: &[&Rewrite<L, N>]) -> Iteration<IterData> {
         assert!(self.stop_reason.is_none());
 
-        info!("\nIteration {}", self.iterations.len());
+        let i = self.iterations.len();
+        info!("\nIteration {}", i);
 
         self.try_start();
         let mut result = self.check_limits();
+        self.scheduler_stats = self.scheduler.stats(i);
 
         let egraph_nodes = self.egraph.total_size();
         let egraph_classes = self.egraph.number_of_classes();
@@ -547,7 +555,6 @@ where
         let egraph_nodes_after_hooks = self.egraph.total_size();
         let egraph_classes_after_hooks = self.egraph.number_of_classes();
 
-        let i = self.iterations.len();
         trace!("EGraph {:?}", self.egraph.dump());
 
         let start_time = Instant::now();
@@ -678,6 +685,14 @@ where
     L: Language,
     N: Analysis<L>,
 {
+    /// Return a fixed-width snapshot of scheduler state for `iteration`.
+    ///
+    /// The default reports no scheduler state, preserving compatibility for
+    /// schedulers that do not track bans.
+    fn stats(&self, iteration: usize) -> SchedulerStats {
+        SchedulerStats::default()
+    }
+
     /// Whether or not the [`Runner`] is allowed
     /// to say it has saturated.
     ///
@@ -790,6 +805,19 @@ where
 {
 }
 
+/// Fixed-width aggregate scheduler state for one iteration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SchedulerStats {
+    /// Number of rules whose ban expires after this iteration.
+    pub n_banned: usize,
+    /// Number of rules whose ban expires exactly at this iteration.
+    pub n_unbanned_this_iter: usize,
+    /// Fewest iterations remaining among currently banned rules.
+    pub min_ban_remaining: usize,
+    /// Total number of bans issued across all rules.
+    pub total_times_banned: usize,
+}
+
 /// A [`RewriteScheduler`] that implements exponentional rule backoff.
 ///
 /// For each rewrite, there exists a configurable initial match limit.
@@ -881,6 +909,25 @@ where
     L: Language,
     N: Analysis<L>,
 {
+    fn stats(&self, iteration: usize) -> SchedulerStats {
+        let mut result = SchedulerStats::default();
+        for stats in self.stats.values() {
+            result.total_times_banned += stats.times_banned;
+            if stats.banned_until > iteration {
+                result.n_banned += 1;
+                let remaining = stats.banned_until - iteration;
+                result.min_ban_remaining = if result.min_ban_remaining == 0 {
+                    remaining
+                } else {
+                    result.min_ban_remaining.min(remaining)
+                };
+            } else if stats.banned_until == iteration {
+                result.n_unbanned_this_iter += 1;
+            }
+        }
+        result
+    }
+
     fn can_stop(&mut self, iteration: usize) -> bool {
         let n_stats = self.stats.len();
 
@@ -992,4 +1039,132 @@ where
     N: Analysis<L>,
 {
     fn make(_: &Runner<L, N, Self>) -> Self {}
+}
+
+#[cfg(test)]
+mod scheduler_stats_tests {
+    use super::*;
+    use crate::{SymbolLang, rewrite as rw};
+
+    fn stats(scheduler: &BackoffScheduler, iteration: usize) -> SchedulerStats {
+        <BackoffScheduler as RewriteScheduler<SymbolLang, ()>>::stats(scheduler, iteration)
+    }
+
+    #[test]
+    fn empty_scheduler_snapshot_is_zero() {
+        assert_eq!(
+            stats(&BackoffScheduler::default(), 0),
+            SchedulerStats::default()
+        );
+        assert_eq!(
+            <SimpleScheduler as RewriteScheduler<SymbolLang, ()>>::stats(&SimpleScheduler, 0),
+            SchedulerStats::default()
+        );
+    }
+
+    #[test]
+    fn known_backoff_state_has_exact_aggregates() {
+        let mut scheduler = BackoffScheduler::default();
+        scheduler.stats.insert(
+            "a".into(),
+            RuleStats {
+                times_applied: 0,
+                banned_until: 8,
+                times_banned: 2,
+                match_limit: 10,
+                ban_length: 3,
+            },
+        );
+        scheduler.stats.insert(
+            "b".into(),
+            RuleStats {
+                times_applied: 0,
+                banned_until: 6,
+                times_banned: 1,
+                match_limit: 10,
+                ban_length: 3,
+            },
+        );
+        scheduler.stats.insert(
+            "c".into(),
+            RuleStats {
+                times_applied: 0,
+                banned_until: 0,
+                times_banned: 4,
+                match_limit: 10,
+                ban_length: 3,
+            },
+        );
+
+        assert_eq!(
+            stats(&scheduler, 5),
+            SchedulerStats {
+                n_banned: 2,
+                n_unbanned_this_iter: 0,
+                min_ban_remaining: 1,
+                total_times_banned: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn expiry_is_reported_only_on_its_exact_iteration() {
+        let mut scheduler = BackoffScheduler::default();
+        scheduler.stats.insert(
+            "a".into(),
+            RuleStats {
+                times_applied: 0,
+                banned_until: 4,
+                times_banned: 1,
+                match_limit: 10,
+                ban_length: 3,
+            },
+        );
+
+        assert_eq!(stats(&scheduler, 3).n_unbanned_this_iter, 0);
+        assert_eq!(stats(&scheduler, 4).n_unbanned_this_iter, 1);
+        assert_eq!(stats(&scheduler, 5).n_unbanned_this_iter, 0);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CapturedStats(SchedulerStats);
+
+    impl IterationData<SymbolLang, ()> for CapturedStats {
+        fn make(runner: &Runner<SymbolLang, (), Self>) -> Self {
+            Self(runner.scheduler_stats)
+        }
+    }
+
+    #[test]
+    fn runner_stores_snapshot_from_before_search() {
+        let rewrite = rw!("expand"; "?a" => "(f ?a)");
+        let runner = Runner::<SymbolLang, (), CapturedStats>::new(())
+            .with_expr(&"x".parse().unwrap())
+            .with_iter_limit(3)
+            .with_scheduler(
+                BackoffScheduler::default()
+                    .with_initial_match_limit(0)
+                    .with_ban_length(5),
+            )
+            .run(&[rewrite]);
+
+        assert_eq!(runner.iterations[0].data.0, SchedulerStats::default());
+        assert_eq!(runner.iterations[1].data.0.total_times_banned, 1);
+        assert_eq!(runner.iterations[2].data.0.total_times_banned, 2);
+    }
+
+    #[test]
+    fn backoff_application_and_iteration_behavior_is_unchanged() {
+        let rewrite = rw!("add-zero"; "(+ ?a 0)" => "?a");
+        let runner = Runner::<SymbolLang, ()>::default()
+            .with_expr(&"(+ x 0)".parse().unwrap())
+            .with_iter_limit(3)
+            .with_scheduler(BackoffScheduler::default())
+            .run(&[rewrite]);
+
+        assert_eq!(runner.iterations.len(), 2);
+        assert_eq!(runner.iterations[0].applied[&Symbol::from("add-zero")], 1);
+        assert!(runner.iterations[1].applied.is_empty());
+        assert!(matches!(runner.stop_reason, Some(StopReason::Saturated)));
+    }
 }
