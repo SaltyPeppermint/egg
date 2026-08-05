@@ -163,42 +163,30 @@ pub struct Runner<L: Language, N: Analysis<L>, IterData = ()> {
 /// A function that samples the process's current live heap in bytes.
 pub type MemorySampler = fn() -> u64;
 
-/// One process-heap sample in absolute and run-relative coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde-1", derive(serde::Serialize))]
-pub struct MemoryReading {
-    /// The absolute process live heap.
-    pub absolute: u64,
-    /// Growth since the runner's baseline, saturating at zero.
-    pub relative: u64,
-}
-
 /// The final memory accounting for a completed [`Runner`] run.
+///
+/// Every figure is an absolute process live-heap byte count, the same
+/// coordinate system the configured ceiling is expressed in, so readings are
+/// directly comparable across runs and processes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde-1", derive(serde::Serialize))]
 pub struct MemoryReport {
-    /// The process live heap sampled before constructing the runner.
-    pub baseline: u64,
     /// A fresh sample taken at the end of [`Runner::run`].
-    pub final_reading: MemoryReading,
+    pub final_reading: u64,
     /// The configured absolute process live-heap ceiling.
     pub absolute_limit: Option<u64>,
-    /// The ceiling relative to `baseline`, saturating at zero.
-    pub relative_limit: Option<u64>,
 }
 
 struct MemoryTracker {
     sampler: MemorySampler,
-    baseline: u64,
     absolute_limit: Option<u64>,
-    latest: Cell<MemoryReading>,
-    final_reading: Cell<Option<MemoryReading>>,
+    latest: Cell<u64>,
+    final_reading: Cell<Option<u64>>,
 }
 
 impl Debug for MemoryTracker {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("MemoryTracker")
-            .field("baseline", &self.baseline)
             .field("absolute_limit", &self.absolute_limit)
             .field("latest", &self.latest)
             .field("final_reading", &self.final_reading)
@@ -207,33 +195,21 @@ impl Debug for MemoryTracker {
 }
 
 impl MemoryTracker {
-    fn new(sampler: MemorySampler, baseline: u64, absolute_limit: Option<u64>) -> Self {
-        let initial = MemoryReading {
-            absolute: baseline,
-            relative: 0,
-        };
+    fn new(sampler: MemorySampler, absolute_limit: Option<u64>) -> Self {
+        // Seed `latest` so a reading is available before the first sample.
+        let initial = sampler();
         Self {
             sampler,
-            baseline,
             absolute_limit,
             latest: Cell::new(initial),
             final_reading: Cell::new(None),
         }
     }
 
-    fn sample(&self) -> MemoryReading {
-        let absolute = (self.sampler)();
-        let reading = MemoryReading {
-            absolute,
-            relative: absolute.saturating_sub(self.baseline),
-        };
+    fn sample(&self) -> u64 {
+        let reading = (self.sampler)();
         self.latest.set(reading);
         reading
-    }
-
-    fn relative_limit(&self) -> Option<u64> {
-        self.absolute_limit
-            .map(|limit| limit.saturating_sub(self.baseline))
     }
 
     fn finish(&self) {
@@ -242,10 +218,8 @@ impl MemoryTracker {
 
     fn final_report(&self) -> Option<MemoryReport> {
         self.final_reading.get().map(|final_reading| MemoryReport {
-            baseline: self.baseline,
             final_reading,
             absolute_limit: self.absolute_limit,
-            relative_limit: self.relative_limit(),
         })
     }
 }
@@ -286,11 +260,9 @@ impl RunnerLimits {
         }
 
         if let (Some(memory), Some(reading)) = (&self.memory, memory_reading)
-            && memory
-                .absolute_limit
-                .is_some_and(|limit| reading.absolute > limit)
+            && memory.absolute_limit.is_some_and(|limit| reading > limit)
         {
-            return Err(StopReason::MemoryLimit(reading.absolute));
+            return Err(StopReason::MemoryLimit(reading));
         }
 
         Ok(())
@@ -455,17 +427,13 @@ where
     }
 
     /// Create a new `Runner` whose process memory is sampled and optionally
-    /// limited. The baseline is captured before any runner-owned allocation.
+    /// limited. Readings and the limit are absolute process live-heap bytes.
     pub fn new_with_memory_tracker(
         analysis: N,
         sampler: MemorySampler,
         absolute_limit: Option<u64>,
     ) -> Self {
-        let baseline = sampler();
-        Self::new_internal(
-            analysis,
-            Some(MemoryTracker::new(sampler, baseline, absolute_limit)),
-        )
+        Self::new_internal(analysis, Some(MemoryTracker::new(sampler, absolute_limit)))
     }
 
     fn new_internal(analysis: N, memory: Option<MemoryTracker>) -> Self {
@@ -487,24 +455,18 @@ where
         }
     }
 
-    /// Return the most recent sample already taken by this runner.
+    /// Return the most recent absolute sample already taken by this runner.
     #[must_use]
-    pub fn memory_reading(&self) -> Option<MemoryReading> {
+    pub fn memory_reading(&self) -> Option<u64> {
         self.limits
             .memory
             .as_ref()
             .map(|memory| memory.latest.get())
     }
 
-    /// Take, store, and return a fresh process-memory sample.
-    pub fn sample_memory(&self) -> Option<MemoryReading> {
+    /// Take, store, and return a fresh absolute process-memory sample.
+    pub fn sample_memory(&self) -> Option<u64> {
         self.limits.memory.as_ref().map(MemoryTracker::sample)
-    }
-
-    /// Return the process live-heap baseline captured before construction.
-    #[must_use]
-    pub fn memory_baseline(&self) -> Option<u64> {
-        self.limits.memory.as_ref().map(|memory| memory.baseline)
     }
 
     /// Return the configured absolute process live-heap ceiling.
@@ -514,15 +476,6 @@ where
             .memory
             .as_ref()
             .and_then(|memory| memory.absolute_limit)
-    }
-
-    /// Return the configured ceiling relative to this runner's baseline.
-    #[must_use]
-    pub fn relative_memory_limit(&self) -> Option<u64> {
-        self.limits
-            .memory
-            .as_ref()
-            .and_then(MemoryTracker::relative_limit)
     }
 
     /// Return the final report after [`Runner::run`] has finalized memory.
