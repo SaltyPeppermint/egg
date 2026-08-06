@@ -1,4 +1,4 @@
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::fmt::{self, Debug, Formatter};
 
 use crate::no_std_prelude::*;
@@ -147,9 +147,9 @@ pub struct Runner<L: Language, N: Analysis<L>, IterData = ()> {
     /// Why the `Runner` stopped. This will be `None` if it hasn't
     /// stopped yet.
     pub stop_reason: Option<StopReason>,
-    /// A snapshot of scheduler state captured before the current iteration's
-    /// hooks and rewrite search.
-    pub scheduler_stats: SchedulerStats,
+    /// A read-only snapshot of the exact scheduler state captured before the
+    /// current iteration's hooks and rewrite search.
+    pub scheduler_snapshot: SchedulerSnapshot,
 
     /// The hooks added by the
     /// [`with_hook`](Runner::with_hook()) method, in insertion order.
@@ -177,11 +177,43 @@ pub struct MemoryReport {
     pub absolute_limit: Option<u64>,
 }
 
+/// A limit-check boundary at which process memory was sampled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde-1", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde-1", serde(rename_all = "snake_case"))]
+pub enum MemorySamplePhase {
+    /// The iteration-start sample, immediately before hooks.
+    BeforeHooks,
+    /// An explicit sample requested while hooks are running.
+    DuringHook,
+    /// The sample immediately after one rule's search.
+    AfterRuleSearch,
+    /// The sample immediately after one rule's application.
+    AfterRuleApplication,
+    /// The sample after rebuild and iteration finalization.
+    AfterRebuildFinalization,
+}
+
+/// Iteration-local peak process-memory telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde-1", derive(serde::Serialize))]
+pub struct IterationMemoryPeak {
+    /// Allocation at the decision boundary immediately before hooks.
+    pub iteration_start_allocated: u64,
+    /// Largest reading observed at any sampled boundary in this iteration.
+    pub iteration_peak_allocated: u64,
+    /// Boundary where `iteration_peak_allocated` was first observed.
+    pub peak_phase: MemorySamplePhase,
+    /// Rule responsible for the peak when it followed a rule operation.
+    pub peak_rule: Option<Symbol>,
+}
+
 struct MemoryTracker {
     sampler: MemorySampler,
     absolute_limit: Option<u64>,
     latest: Cell<u64>,
     final_reading: Cell<Option<u64>>,
+    iteration_peak: RefCell<Option<IterationMemoryPeak>>,
 }
 
 impl Debug for MemoryTracker {
@@ -190,6 +222,7 @@ impl Debug for MemoryTracker {
             .field("absolute_limit", &self.absolute_limit)
             .field("latest", &self.latest)
             .field("final_reading", &self.final_reading)
+            .field("iteration_peak", &self.iteration_peak)
             .finish_non_exhaustive()
     }
 }
@@ -203,17 +236,46 @@ impl MemoryTracker {
             absolute_limit,
             latest: Cell::new(initial),
             final_reading: Cell::new(None),
+            iteration_peak: RefCell::new(None),
         }
     }
 
-    fn sample(&self) -> u64 {
+    fn raw_sample(&self) -> u64 {
         let reading = (self.sampler)();
         self.latest.set(reading);
         reading
     }
 
+    fn begin_iteration(&self) -> u64 {
+        let reading = self.raw_sample();
+        self.iteration_peak.replace(Some(IterationMemoryPeak {
+            iteration_start_allocated: reading,
+            iteration_peak_allocated: reading,
+            peak_phase: MemorySamplePhase::BeforeHooks,
+            peak_rule: None,
+        }));
+        reading
+    }
+
+    fn sample_at(&self, phase: MemorySamplePhase, rule: Option<Symbol>) -> u64 {
+        let reading = self.raw_sample();
+        let mut peak = self.iteration_peak.borrow_mut();
+        if let Some(peak) = peak.as_mut()
+            && reading > peak.iteration_peak_allocated
+        {
+            peak.iteration_peak_allocated = reading;
+            peak.peak_phase = phase;
+            peak.peak_rule = rule;
+        }
+        reading
+    }
+
+    fn iteration_peak(&self) -> Option<IterationMemoryPeak> {
+        self.iteration_peak.borrow().clone()
+    }
+
     fn finish(&self) {
-        self.final_reading.set(Some(self.sample()));
+        self.final_reading.set(Some(self.raw_sample()));
     }
 
     fn final_report(&self) -> Option<MemoryReport> {
@@ -235,16 +297,16 @@ pub struct RunnerLimits {
 }
 
 impl RunnerLimits {
-    /// Check if the [`Runner`] should stop based on the limits.
-    pub fn check_limits<L, N>(&self, iteration: usize, egraph: &EGraph<L, N>) -> RunnerResult<()>
+    fn check_reading<L, N>(
+        &self,
+        iteration: usize,
+        egraph: &EGraph<L, N>,
+        memory_reading: Option<u64>,
+    ) -> RunnerResult<()>
     where
         L: Language,
         N: Analysis<L>,
     {
-        // Sample first so every limit-check boundary updates the runner's
-        // reading, while preserving the stable time/node/iteration priority.
-        let memory_reading = self.memory.as_ref().map(MemoryTracker::sample);
-
         let elapsed = self.start_time.unwrap().elapsed();
         if elapsed > self.time_limit {
             return Err(StopReason::TimeLimit(elapsed.as_secs_f64()));
@@ -260,12 +322,50 @@ impl RunnerLimits {
         }
 
         if let (Some(memory), Some(reading)) = (&self.memory, memory_reading)
-            && memory.absolute_limit.is_some_and(|limit| reading > limit)
+            && memory.absolute_limit.is_some_and(|limit| reading >= limit)
         {
             return Err(StopReason::MemoryLimit(reading));
         }
 
         Ok(())
+    }
+
+    fn begin_iteration<L, N>(&self, iteration: usize, egraph: &EGraph<L, N>) -> RunnerResult<()>
+    where
+        L: Language,
+        N: Analysis<L>,
+    {
+        let reading = self.memory.as_ref().map(MemoryTracker::begin_iteration);
+        self.check_reading(iteration, egraph, reading)
+    }
+
+    /// Check limits using one process-memory reading attributed to `phase`.
+    pub fn check_limits_at<L, N>(
+        &self,
+        iteration: usize,
+        egraph: &EGraph<L, N>,
+        phase: MemorySamplePhase,
+        rule: Option<Symbol>,
+    ) -> RunnerResult<()>
+    where
+        L: Language,
+        N: Analysis<L>,
+    {
+        let reading = self
+            .memory
+            .as_ref()
+            .map(|memory| memory.sample_at(phase, rule));
+        self.check_reading(iteration, egraph, reading)
+    }
+
+    /// Compatibility limit check for custom schedulers that cannot attribute
+    /// a boundary to a specific rule.
+    pub fn check_limits<L, N>(&self, iteration: usize, egraph: &EGraph<L, N>) -> RunnerResult<()>
+    where
+        L: Language,
+        N: Analysis<L>,
+    {
+        self.check_limits_at(iteration, egraph, MemorySamplePhase::AfterRuleSearch, None)
     }
 }
 
@@ -292,7 +392,7 @@ where
             iterations,
             roots,
             stop_reason,
-            scheduler_stats,
+            scheduler_snapshot,
             hooks,
             limits,
             scheduler: _,
@@ -303,7 +403,7 @@ where
             .field("iterations", iterations)
             .field("roots", roots)
             .field("stop_reason", stop_reason)
-            .field("scheduler_stats", scheduler_stats)
+            .field("scheduler_snapshot", scheduler_snapshot)
             .field("hooks", &vec![format_args!("<dyn FnMut ..>"); hooks.len()])
             .field("limits", limits)
             .field("scheduler", &format_args!("<dyn RewriteScheduler ..>"))
@@ -325,7 +425,7 @@ pub enum StopReason {
     NodeLimit(usize),
     /// The time limit was hit. The data is the time limit in seconds.
     TimeLimit(f64),
-    /// The absolute process live-heap limit was exceeded. The data is the
+    /// The absolute process live-heap limit was reached or exceeded. The data is the
     /// observed absolute live heap in bytes.
     MemoryLimit(u64),
     /// Some other reason to stop.
@@ -449,7 +549,7 @@ where
             roots: vec![],
             iterations: vec![],
             stop_reason: None,
-            scheduler_stats: SchedulerStats::default(),
+            scheduler_snapshot: SchedulerSnapshot::default(),
             hooks: vec![],
             scheduler: Box::new(BackoffScheduler::default()),
         }
@@ -466,7 +566,19 @@ where
 
     /// Take, store, and return a fresh absolute process-memory sample.
     pub fn sample_memory(&self) -> Option<u64> {
-        self.limits.memory.as_ref().map(MemoryTracker::sample)
+        self.limits
+            .memory
+            .as_ref()
+            .map(|memory| memory.sample_at(MemorySamplePhase::DuringHook, None))
+    }
+
+    /// Return the current iteration's peak-memory telemetry.
+    #[must_use]
+    pub fn iteration_memory_peak(&self) -> Option<IterationMemoryPeak> {
+        self.limits
+            .memory
+            .as_ref()
+            .and_then(MemoryTracker::iteration_peak)
     }
 
     /// Return the configured absolute process live-heap ceiling.
@@ -665,8 +777,8 @@ where
         info!("\nIteration {}", i);
 
         self.try_start();
-        let mut result = self.check_limits();
-        self.scheduler_stats = self.scheduler.stats(i);
+        let mut result = self.limits.begin_iteration(i, &self.egraph);
+        self.scheduler_snapshot = self.scheduler.snapshot(i, rules);
 
         let egraph_nodes = self.egraph.total_size();
         let egraph_classes = self.egraph.number_of_classes();
@@ -721,7 +833,7 @@ where
                     }
                     debug!("Applied {} {} times", rw.name, actually_matched);
                 }
-                self.check_limits()
+                self.check_limits_at(MemorySamplePhase::AfterRuleApplication, Some(rw.name))
             })
         });
 
@@ -741,6 +853,11 @@ where
             self.egraph.total_size(),
             self.egraph.number_of_classes()
         );
+
+        let finalized = self.check_limits_at(MemorySamplePhase::AfterRebuildFinalization, None);
+        if result.is_ok() {
+            result = finalized;
+        }
 
         let can_be_saturated = applied.is_empty()
             && self.scheduler.can_stop(i)
@@ -776,8 +893,14 @@ where
     }
 
     fn check_limits(&self) -> RunnerResult<()> {
+        let reading = self.memory_reading();
         self.limits
-            .check_limits(self.iterations.len(), &self.egraph)
+            .check_reading(self.iterations.len(), &self.egraph, reading)
+    }
+
+    fn check_limits_at(&self, phase: MemorySamplePhase, rule: Option<Symbol>) -> RunnerResult<()> {
+        self.limits
+            .check_limits_at(self.iterations.len(), &self.egraph, phase, rule)
     }
 }
 
@@ -814,12 +937,22 @@ where
     L: Language,
     N: Analysis<L>,
 {
-    /// Return a fixed-width snapshot of scheduler state for `iteration`.
-    ///
-    /// The default reports no scheduler state, preserving compatibility for
-    /// schedulers that do not track bans.
+    /// Legacy aggregate-only introspection. New code should use
+    /// [`Self::snapshot`], which includes the exact per-rule search state.
     fn stats(&self, iteration: usize) -> SchedulerStats {
+        let _ = iteration;
         SchedulerStats::default()
+    }
+
+    /// Return a read-only snapshot of scheduler state for the iteration that
+    /// is about to search.
+    ///
+    /// The default identifies itself as a generic scheduler and reports every
+    /// rule active with no finite match threshold. A model may deliberately
+    /// support that representation, but a manifest requiring backoff state
+    /// must reject it.
+    fn snapshot(&self, iteration: usize, rewrites: &[&Rewrite<L, N>]) -> SchedulerSnapshot {
+        SchedulerSnapshot::generic(iteration, rewrites)
     }
 
     /// Whether or not the [`Runner`] is allowed
@@ -891,7 +1024,12 @@ where
         for rw in rewrites {
             let ms = self.search_rewrite(iteration, egraph, rw);
             matches.push(ms);
-            limits.check_limits(iteration, egraph)?;
+            limits.check_limits_at(
+                iteration,
+                egraph,
+                MemorySamplePhase::AfterRuleSearch,
+                Some(rw.name),
+            )?;
         }
         Ok(matches)
     }
@@ -934,7 +1072,7 @@ where
 {
 }
 
-/// Fixed-width aggregate scheduler state for one iteration.
+/// Legacy fixed-width aggregate scheduler state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SchedulerStats {
     /// Number of rules whose ban expires after this iteration.
@@ -945,6 +1083,136 @@ pub struct SchedulerStats {
     pub min_ban_remaining: usize,
     /// Total number of bans issued across all rules.
     pub total_times_banned: usize,
+}
+
+/// Per-rule state governing one upcoming rewrite search.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde-1", derive(serde::Serialize))]
+pub struct SchedulerRuleState {
+    /// Raw egg rule name.
+    pub name: Symbol,
+    /// Whether this rule will be searched in the upcoming iteration.
+    pub will_search: bool,
+    /// Whether a previous ban expires exactly at this iteration.
+    pub newly_unbanned: bool,
+    /// Number of times the scheduler has banned this rule.
+    pub times_banned: usize,
+    /// Remaining iterations in the ban, or zero when active.
+    pub ban_remaining: usize,
+    /// Exact effective match threshold used by `search_rewrite`.
+    pub match_limit: usize,
+    /// Stable logarithmic representation of `match_limit`.
+    pub log2_match_limit: f64,
+}
+
+/// Aggregate and per-rule scheduler state for one upcoming iteration.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde-1", derive(serde::Serialize))]
+pub struct SchedulerSnapshot {
+    /// Scheduler representation name used for manifest compatibility.
+    pub scheduler: &'static str,
+    /// Number of rules active for the upcoming search.
+    pub n_active: usize,
+    /// Number of rules whose ban expires after this iteration.
+    pub n_banned: usize,
+    /// Number of rules whose previous ban expires exactly this iteration.
+    pub n_newly_unbanned: usize,
+    /// Fewest iterations remaining among currently banned rules.
+    pub min_ban_remaining: usize,
+    /// Total number of bans issued across all rules.
+    pub total_times_banned: usize,
+    /// Largest effective log2 match limit among active rules.
+    pub max_active_log2_match_limit: f64,
+    /// `log2(1 + sum(active match limits))`.
+    pub log2_active_match_limit_sum: f64,
+    /// Largest ban count among active rules.
+    pub max_active_times_banned: usize,
+    /// State for every rule, in the rewrite slice's deterministic order.
+    pub rules: Vec<SchedulerRuleState>,
+}
+
+impl SchedulerSnapshot {
+    fn generic<L, N>(iteration: usize, rewrites: &[&Rewrite<L, N>]) -> Self
+    where
+        L: Language,
+        N: Analysis<L>,
+    {
+        let rules = rewrites
+            .iter()
+            .map(|rewrite| SchedulerRuleState {
+                name: rewrite.name,
+                will_search: true,
+                newly_unbanned: false,
+                times_banned: 0,
+                ban_remaining: 0,
+                match_limit: usize::MAX,
+                log2_match_limit: match_limit_log2(usize::MAX),
+            })
+            .collect();
+        let mut result = Self {
+            scheduler: "generic",
+            rules,
+            ..Self::default()
+        };
+        result.recompute_aggregates();
+        let _ = iteration;
+        result
+    }
+
+    fn recompute_aggregates(&mut self) {
+        self.n_active = self.rules.iter().filter(|rule| rule.will_search).count();
+        self.n_banned = self.rules.len() - self.n_active;
+        self.n_newly_unbanned = self.rules.iter().filter(|rule| rule.newly_unbanned).count();
+        self.min_ban_remaining = self
+            .rules
+            .iter()
+            .filter_map(|rule| (rule.ban_remaining > 0).then_some(rule.ban_remaining))
+            .min()
+            .unwrap_or(0);
+        self.total_times_banned = self.rules.iter().map(|rule| rule.times_banned).sum();
+        self.max_active_log2_match_limit = self
+            .rules
+            .iter()
+            .filter(|rule| rule.will_search)
+            .map(|rule| rule.log2_match_limit)
+            .fold(0.0, f64::max);
+        let active_limit_sum = self
+            .rules
+            .iter()
+            .filter(|rule| rule.will_search)
+            .map(|rule| rule.match_limit as f64)
+            .sum::<f64>();
+        self.log2_active_match_limit_sum = (1.0 + active_limit_sum).log2();
+        self.max_active_times_banned = self
+            .rules
+            .iter()
+            .filter(|rule| rule.will_search)
+            .map(|rule| rule.times_banned)
+            .max()
+            .unwrap_or(0);
+    }
+}
+
+/// Saturating effective threshold shared by introspection and search.
+fn effective_match_limit(base: usize, times_banned: usize) -> usize {
+    if base == 0 {
+        return 0;
+    }
+    let Ok(shift) = u32::try_from(times_banned) else {
+        return usize::MAX;
+    };
+    if shift >= usize::BITS {
+        return usize::MAX;
+    }
+    base.checked_mul(1_usize << shift).unwrap_or(usize::MAX)
+}
+
+fn match_limit_log2(limit: usize) -> f64 {
+    if limit == 0 {
+        0.0
+    } else {
+        (limit as f64).log2()
+    }
 }
 
 /// A [`RewriteScheduler`] that implements exponentional rule backoff.
@@ -1050,10 +1318,40 @@ where
                 } else {
                     result.min_ban_remaining.min(remaining)
                 };
-            } else if stats.banned_until == iteration {
+            } else if stats.times_banned > 0 && stats.banned_until == iteration {
                 result.n_unbanned_this_iter += 1;
             }
         }
+        result
+    }
+
+    fn snapshot(&self, iteration: usize, rewrites: &[&Rewrite<L, N>]) -> SchedulerSnapshot {
+        let rules = rewrites
+            .iter()
+            .map(|rewrite| {
+                let stored = self.stats.get(&rewrite.name);
+                let banned_until = stored.map_or(0, |stats| stats.banned_until);
+                let times_banned = stored.map_or(0, |stats| stats.times_banned);
+                let base_limit = stored.map_or(self.default_match_limit, |stats| stats.match_limit);
+                let will_search = banned_until <= iteration;
+                let match_limit = effective_match_limit(base_limit, times_banned);
+                SchedulerRuleState {
+                    name: rewrite.name,
+                    will_search,
+                    newly_unbanned: times_banned > 0 && banned_until == iteration,
+                    times_banned,
+                    ban_remaining: banned_until.saturating_sub(iteration),
+                    match_limit,
+                    log2_match_limit: match_limit_log2(match_limit),
+                }
+            })
+            .collect();
+        let mut result = SchedulerSnapshot {
+            scheduler: "backoff",
+            rules,
+            ..SchedulerSnapshot::default()
+        };
+        result.recompute_aggregates();
         result
     }
 
@@ -1115,16 +1413,13 @@ where
             return vec![];
         }
 
-        let threshold = stats
-            .match_limit
-            .checked_shl(stats.times_banned as u32)
-            .unwrap();
+        let threshold = effective_match_limit(stats.match_limit, stats.times_banned);
         let matches = rewrite.search_with_limit(egraph, threshold.saturating_add(1));
         let total_len: usize = matches.iter().map(|m| m.substs.len()).sum();
         if total_len > threshold {
-            let ban_length = stats.ban_length << stats.times_banned;
+            let ban_length = effective_match_limit(stats.ban_length, stats.times_banned);
             stats.times_banned += 1;
-            stats.banned_until = iteration + ban_length;
+            stats.banned_until = iteration.saturating_add(ban_length);
             info!(
                 "Banning {} ({}-{}) for {} iters: {} < {}",
                 rewrite.name,
@@ -1171,28 +1466,42 @@ where
 }
 
 #[cfg(test)]
-mod scheduler_stats_tests {
+mod scheduler_snapshot_tests {
     use super::*;
     use crate::{SymbolLang, rewrite as rw};
 
-    fn stats(scheduler: &BackoffScheduler, iteration: usize) -> SchedulerStats {
-        <BackoffScheduler as RewriteScheduler<SymbolLang, ()>>::stats(scheduler, iteration)
+    fn snapshot(
+        scheduler: &BackoffScheduler,
+        iteration: usize,
+        rules: &[&Rewrite<SymbolLang, ()>],
+    ) -> SchedulerSnapshot {
+        <BackoffScheduler as RewriteScheduler<SymbolLang, ()>>::snapshot(
+            scheduler, iteration, rules,
+        )
     }
 
     #[test]
-    fn empty_scheduler_snapshot_is_zero() {
+    fn snapshot_includes_every_rule_before_first_search() {
+        let a = rw!("a"; "?x" => "(f ?x)");
+        let b = rw!("b"; "?x" => "(g ?x)");
+        let rules = [&a, &b];
+        let state = snapshot(&BackoffScheduler::default(), 0, &rules);
+        assert_eq!(state.scheduler, "backoff");
+        assert_eq!(state.n_active, 2);
         assert_eq!(
-            stats(&BackoffScheduler::default(), 0),
-            SchedulerStats::default()
+            state.rules.iter().map(|rule| rule.name).collect::<Vec<_>>(),
+            vec![Symbol::from("a"), Symbol::from("b")]
         );
-        assert_eq!(
-            <SimpleScheduler as RewriteScheduler<SymbolLang, ()>>::stats(&SimpleScheduler, 0),
-            SchedulerStats::default()
-        );
+        assert!(state.rules.iter().all(|rule| rule.will_search));
+        assert!(state.rules.iter().all(|rule| !rule.newly_unbanned));
     }
 
     #[test]
-    fn known_backoff_state_has_exact_aggregates() {
+    fn active_banned_and_newly_unbanned_state_is_exact() {
+        let a = rw!("a"; "?x" => "(f ?x)");
+        let b = rw!("b"; "?x" => "(g ?x)");
+        let c = rw!("c"; "?x" => "(h ?x)");
+        let rules = [&a, &b, &c];
         let mut scheduler = BackoffScheduler::default();
         scheduler.stats.insert(
             "a".into(),
@@ -1225,49 +1534,63 @@ mod scheduler_stats_tests {
             },
         );
 
-        assert_eq!(
-            stats(&scheduler, 5),
-            SchedulerStats {
-                n_banned: 2,
-                n_unbanned_this_iter: 0,
-                min_ban_remaining: 1,
-                total_times_banned: 7,
-            }
-        );
+        let state = snapshot(&scheduler, 6, &rules);
+        assert_eq!(state.n_active, 2);
+        assert_eq!(state.n_banned, 1);
+        assert_eq!(state.n_newly_unbanned, 1);
+        assert_eq!(state.min_ban_remaining, 2);
+        assert_eq!(state.total_times_banned, 7);
+        assert!(!state.rules[0].will_search);
+        assert_eq!(state.rules[0].ban_remaining, 2);
+        assert!(state.rules[1].will_search);
+        assert!(state.rules[1].newly_unbanned);
+        assert!(state.rules[2].will_search);
     }
 
     #[test]
-    fn expiry_is_reported_only_on_its_exact_iteration() {
-        let mut scheduler = BackoffScheduler::default();
-        scheduler.stats.insert(
-            "a".into(),
-            RuleStats {
-                times_applied: 0,
-                banned_until: 4,
-                times_banned: 1,
-                match_limit: 10,
-                ban_length: 3,
-            },
-        );
-
-        assert_eq!(stats(&scheduler, 3).n_unbanned_this_iter, 0);
-        assert_eq!(stats(&scheduler, 4).n_unbanned_this_iter, 1);
-        assert_eq!(stats(&scheduler, 5).n_unbanned_this_iter, 0);
+    fn effective_limit_saturates_instead_of_shifting_with_overflow() {
+        assert_eq!(effective_match_limit(1_000, 3), 8_000);
+        assert_eq!(effective_match_limit(usize::MAX, 1), usize::MAX);
+        assert_eq!(effective_match_limit(1, usize::MAX), usize::MAX);
+        assert_eq!(effective_match_limit(0, usize::MAX), 0);
+        assert!(match_limit_log2(effective_match_limit(1, usize::MAX)).is_finite());
     }
 
-    #[derive(Debug, PartialEq, Eq)]
-    struct CapturedStats(SchedulerStats);
+    #[test]
+    fn introspected_effective_limit_is_the_search_threshold() {
+        let rewrite = rw!("explode"; "?x" => "(f ?x)");
+        let rules = [&rewrite];
+        let mut scheduler = BackoffScheduler::default().with_initial_match_limit(0);
+        let before = snapshot(&scheduler, 0, &rules);
+        assert_eq!(before.rules[0].match_limit, 0);
+        assert_eq!(before.rules[0].log2_match_limit, 0.0);
 
-    impl IterationData<SymbolLang, ()> for CapturedStats {
+        let mut egraph = EGraph::<SymbolLang, ()>::default();
+        egraph.add_expr(&"x".parse().unwrap());
+        egraph.rebuild();
+        let matches = <BackoffScheduler as RewriteScheduler<SymbolLang, ()>>::search_rewrite(
+            &mut scheduler,
+            0,
+            &egraph,
+            &rewrite,
+        );
+        assert!(matches.is_empty());
+        assert_eq!(scheduler.stats[&Symbol::from("explode")].times_banned, 1);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CapturedSnapshot(SchedulerSnapshot);
+
+    impl IterationData<SymbolLang, ()> for CapturedSnapshot {
         fn make(runner: &Runner<SymbolLang, (), Self>) -> Self {
-            Self(runner.scheduler_stats)
+            Self(runner.scheduler_snapshot.clone())
         }
     }
 
     #[test]
     fn runner_stores_snapshot_from_before_search() {
         let rewrite = rw!("expand"; "?a" => "(f ?a)");
-        let runner = Runner::<SymbolLang, (), CapturedStats>::new(())
+        let runner = Runner::<SymbolLang, (), CapturedSnapshot>::new(())
             .with_expr(&"x".parse().unwrap())
             .with_iter_limit(3)
             .with_scheduler(
@@ -1277,23 +1600,116 @@ mod scheduler_stats_tests {
             )
             .run(&[rewrite]);
 
-        assert_eq!(runner.iterations[0].data.0, SchedulerStats::default());
+        assert_eq!(runner.iterations[0].data.0.total_times_banned, 0);
+        assert_eq!(runner.iterations[0].data.0.rules.len(), 1);
         assert_eq!(runner.iterations[1].data.0.total_times_banned, 1);
+        assert!(runner.iterations[1].data.0.rules[0].will_search);
+        assert!(!runner.iterations[1].data.0.rules[0].newly_unbanned);
         assert_eq!(runner.iterations[2].data.0.total_times_banned, 2);
     }
 
     #[test]
-    fn backoff_application_and_iteration_behavior_is_unchanged() {
-        let rewrite = rw!("add-zero"; "(+ ?a 0)" => "?a");
-        let runner = Runner::<SymbolLang, ()>::default()
-            .with_expr(&"(+ x 0)".parse().unwrap())
-            .with_iter_limit(3)
-            .with_scheduler(BackoffScheduler::default())
-            .run(&[rewrite]);
+    fn fast_forwarded_rule_is_active_in_the_next_snapshot() {
+        let rewrite = rw!("a"; "?x" => "(f ?x)");
+        let rules = [&rewrite];
+        let mut scheduler = BackoffScheduler::default();
+        scheduler.stats.insert(
+            "a".into(),
+            RuleStats {
+                times_applied: 0,
+                banned_until: 10,
+                times_banned: 1,
+                match_limit: 10,
+                ban_length: 3,
+            },
+        );
+        assert!(
+            !<BackoffScheduler as RewriteScheduler<SymbolLang, ()>>::can_stop(&mut scheduler, 4)
+        );
+        let state = snapshot(&scheduler, 5, &rules);
+        assert!(state.rules[0].will_search);
+        assert!(!state.rules[0].newly_unbanned);
+        assert_eq!(state.rules[0].ban_remaining, 0);
+    }
+}
 
-        assert_eq!(runner.iterations.len(), 2);
-        assert_eq!(runner.iterations[0].applied[&Symbol::from("add-zero")], 1);
-        assert!(runner.iterations[1].applied.is_empty());
-        assert!(matches!(runner.stop_reason, Some(StopReason::Saturated)));
+#[cfg(test)]
+mod memory_peak_tests {
+    use super::*;
+    use crate::{SymbolLang, rewrite as rw};
+    use std::sync::Mutex;
+
+    static SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn sample() -> u64 {
+        SAMPLES.lock().unwrap().remove(0)
+    }
+
+    #[derive(Debug)]
+    struct CapturedPeak {
+        peak: IterationMemoryPeak,
+        end: u64,
+    }
+
+    impl IterationData<SymbolLang, ()> for CapturedPeak {
+        fn make(runner: &Runner<SymbolLang, (), Self>) -> Self {
+            Self {
+                peak: runner.iteration_memory_peak().unwrap(),
+                end: runner.memory_reading().unwrap(),
+            }
+        }
+    }
+
+    #[test]
+    fn transient_search_peak_is_attributed_retained_and_reset() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // tracker initialization; iteration 0 start/search/apply/finalize;
+        // iteration 1 start/search/apply/finalize; final run report.
+        *SAMPLES.lock().unwrap() = vec![90, 100, 500, 120, 110, 200, 180, 170, 160, 150];
+        let rewrite = rw!("expand"; "?a" => "(f ?a)");
+        let runner =
+            Runner::<SymbolLang, (), CapturedPeak>::new_with_memory_tracker((), sample, None)
+                .with_expr(&"x".parse().unwrap())
+                .with_iter_limit(2)
+                .run(&[rewrite]);
+
+        let first = &runner.iterations[0].data;
+        assert_eq!(first.peak.iteration_start_allocated, 100);
+        assert_eq!(first.peak.iteration_peak_allocated, 500);
+        assert_eq!(first.peak.peak_phase, MemorySamplePhase::AfterRuleSearch);
+        assert_eq!(first.peak.peak_rule, Some(Symbol::from("expand")));
+        assert_eq!(first.end, 110);
+
+        let second = &runner.iterations[1].data;
+        assert_eq!(second.peak.iteration_start_allocated, 200);
+        assert_eq!(second.peak.iteration_peak_allocated, 200);
+        assert_eq!(second.peak.peak_phase, MemorySamplePhase::BeforeHooks);
+        assert_eq!(second.peak.peak_rule, None);
+        assert_eq!(second.end, 160);
+    }
+
+    #[test]
+    fn transient_crossing_survives_after_match_vector_is_dropped() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // No application sample occurs because the post-search hard-limit
+        // check stops the iteration and drops its match vector.
+        *SAMPLES.lock().unwrap() = vec![90, 100, 500, 120, 110];
+        let rewrite = rw!("catastrophic"; "?a" => "(f ?a)");
+        let runner =
+            Runner::<SymbolLang, (), CapturedPeak>::new_with_memory_tracker((), sample, Some(400))
+                .with_expr(&"x".parse().unwrap())
+                .with_iter_limit(5)
+                .run(&[rewrite]);
+
+        assert!(matches!(
+            runner.stop_reason,
+            Some(StopReason::MemoryLimit(500))
+        ));
+        let data = &runner.iterations[0].data;
+        assert_eq!(data.peak.iteration_peak_allocated, 500);
+        assert_eq!(data.peak.peak_rule, Some(Symbol::from("catastrophic")));
+        assert_eq!(data.end, 120);
+        assert!(data.end < 400);
     }
 }
