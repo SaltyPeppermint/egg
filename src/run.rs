@@ -173,6 +173,8 @@ pub type MemorySampler = fn() -> u64;
 pub struct MemoryReport {
     /// A fresh sample taken at the end of [`Runner::run`].
     pub final_reading: u64,
+    /// Largest process live-heap reading sampled during the run.
+    pub peak_reading: u64,
     /// The configured absolute process live-heap ceiling.
     pub absolute_limit: Option<u64>,
 }
@@ -212,6 +214,7 @@ struct MemoryTracker {
     sampler: MemorySampler,
     absolute_limit: Option<u64>,
     latest: Cell<u64>,
+    peak_reading: Cell<u64>,
     final_reading: Cell<Option<u64>>,
     iteration_peak: RefCell<Option<IterationMemoryPeak>>,
 }
@@ -221,6 +224,7 @@ impl Debug for MemoryTracker {
         f.debug_struct("MemoryTracker")
             .field("absolute_limit", &self.absolute_limit)
             .field("latest", &self.latest)
+            .field("peak_reading", &self.peak_reading)
             .field("final_reading", &self.final_reading)
             .field("iteration_peak", &self.iteration_peak)
             .finish_non_exhaustive()
@@ -235,6 +239,7 @@ impl MemoryTracker {
             sampler,
             absolute_limit,
             latest: Cell::new(initial),
+            peak_reading: Cell::new(initial),
             final_reading: Cell::new(None),
             iteration_peak: RefCell::new(None),
         }
@@ -243,6 +248,7 @@ impl MemoryTracker {
     fn raw_sample(&self) -> u64 {
         let reading = (self.sampler)();
         self.latest.set(reading);
+        self.peak_reading.set(self.peak_reading.get().max(reading));
         reading
     }
 
@@ -281,6 +287,7 @@ impl MemoryTracker {
     fn final_report(&self) -> Option<MemoryReport> {
         self.final_reading.get().map(|final_reading| MemoryReport {
             final_reading,
+            peak_reading: self.peak_reading.get(),
             absolute_limit: self.absolute_limit,
         })
     }
