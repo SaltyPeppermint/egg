@@ -121,7 +121,7 @@ pub(crate) use {explain::Explain, unionfind::UnionFind};
 
 pub use {
     eclass::EClass,
-    egraph::{EGraph, LanguageMapper, SimpleLanguageMapper},
+    egraph::{EGraph, LanguageMapper, SimpleLanguageMapper, UnionEvent},
     explain::{
         Explanation, FlatExplanation, FlatTerm, Justification, TreeExplanation, TreeTerm,
         UnionEqualities,

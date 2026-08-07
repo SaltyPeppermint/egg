@@ -663,6 +663,21 @@ where
         Self { scheduler, ..self }
     }
 
+    /// Enable recording of every effective union in this runner's e-graph.
+    ///
+    /// This must be called after [`with_egraph`](Runner::with_egraph), if any,
+    /// and before [`with_expr`](Runner::with_expr), because an existing
+    /// e-graph's union history cannot be reconstructed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the runner's e-graph already contains nodes or recording is
+    /// already enabled.
+    pub fn with_union_event_recording(mut self) -> Self {
+        self.egraph.enable_union_event_recording();
+        self
+    }
+
     /// Add an expression to the egraph to be run.
     ///
     /// The eclass id of this addition will be recorded in the
@@ -1470,6 +1485,26 @@ where
     N: Analysis<L>,
 {
     fn make(_: &Runner<L, N, Self>) -> Self {}
+}
+
+#[cfg(test)]
+mod runner_config_tests {
+    use super::*;
+    use crate::SymbolLang;
+
+    #[test]
+    fn union_recording_builder_records_effective_unions() {
+        let mut runner = Runner::<SymbolLang, ()>::default()
+            .with_union_event_recording()
+            .with_expr(&"a".parse().unwrap());
+        let a = runner.roots[0];
+        let b = runner.egraph.add(SymbolLang::leaf("b"));
+
+        assert!(runner.egraph.union(a, b));
+        assert_eq!(runner.egraph.union_event_count(), 1);
+        assert!(!runner.egraph.union(a, b));
+        assert_eq!(runner.egraph.union_event_count(), 1);
+    }
 }
 
 #[cfg(test)]

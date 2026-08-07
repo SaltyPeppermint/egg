@@ -11,6 +11,19 @@ use serde::{Deserialize, Serialize};
 
 use log::*;
 
+/// One effective union recorded by an [`EGraph`].
+///
+/// The ids are stable raw ids. Replaying the events in order reproduces the
+/// e-graph's equivalence relation, although the replay may choose different
+/// canonical representatives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnionEvent {
+    /// One member of the first equivalence class.
+    pub left: Id,
+    /// One member of the second equivalence class.
+    pub right: Id,
+}
+
 /** A data structure to keep track of equalities between expressions.
 
 Check out the [background tutorial](crate::tutorials::_01_background)
@@ -86,6 +99,12 @@ pub struct EGraph<L: Language, N: Analysis<L>> {
     /// Only manually set it if you know what you're doing.
     #[cfg_attr(feature = "serde-1", serde(skip))]
     pub clean: bool,
+    /// Optional append-only history of effective union-find mutations.
+    ///
+    /// This is transient instrumentation, so it is neither serialized nor
+    /// enabled by default.
+    #[cfg_attr(feature = "serde-1", serde(skip))]
+    union_events: Option<Vec<UnionEvent>>,
 }
 
 #[cfg(feature = "serde-1")]
@@ -123,6 +142,54 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
             memo: Default::default(),
             analysis_pending: Default::default(),
             classes_by_op: Default::default(),
+            union_events: None,
+        }
+    }
+
+    /// Start recording effective unions. Existing union history cannot be
+    /// reconstructed, so recording must be enabled before nodes are added.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the e-graph is not empty or recording is already enabled.
+    pub fn enable_union_event_recording(&mut self) {
+        assert!(
+            self.nodes.is_empty(),
+            "union recording must be enabled before nodes are added"
+        );
+        assert!(
+            self.union_events.is_none(),
+            "union recording is already enabled"
+        );
+        self.union_events = Some(Vec::new());
+    }
+
+    /// Number of effective unions recorded so far.
+    ///
+    /// # Panics
+    ///
+    /// Panics if union recording is not enabled.
+    pub fn union_event_count(&self) -> usize {
+        self.union_events
+            .as_ref()
+            .expect("union recording is not enabled")
+            .len()
+    }
+
+    /// Borrow the effective-union history recorded so far.
+    ///
+    /// # Panics
+    ///
+    /// Panics if union recording is not enabled.
+    pub fn union_events(&self) -> &[UnionEvent] {
+        self.union_events
+            .as_deref()
+            .expect("union recording is not enabled")
+    }
+
+    fn record_union(&mut self, left: Id, right: Id) {
+        if let Some(events) = &mut self.union_events {
+            events.push(UnionEvent { left, right });
         }
     }
 
@@ -659,6 +726,7 @@ where
                 .map(|(k, v)| (self.map_discriminant(k), v))
                 .collect(),
             clean: src_egraph.clean,
+            union_events: None,
         }
     }
 }
@@ -1024,6 +1092,12 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                     explain.add(original.clone(), new_id);
                     debug_assert_eq!(Id::from(self.nodes.len()), new_id);
                     self.nodes.push(original);
+                    if let Some(events) = &mut self.union_events {
+                        events.push(UnionEvent {
+                            left: id,
+                            right: new_id,
+                        });
+                    }
                     self.unionfind.union(id, new_id);
                     explain.union(existing_id, new_id, Justification::Congruence);
                     new_id
@@ -1179,6 +1253,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         }
 
         // make id1 the new root
+        self.record_union(id1, id2);
         self.unionfind.union(id1, id2);
 
         assert_ne!(id1, id2);
